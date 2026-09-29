@@ -62,6 +62,11 @@ type GcOption struct {
 
 	broker           broker.Broker
 	removeObjectPool *conc.Pool[struct{}]
+	dataViewGC       DataViewGarbageCollector
+}
+
+type DataViewGarbageCollector interface {
+	GarbageCollect(ctx context.Context, collectionID int64, retainLatest int) error
 }
 
 // garbageCollector handles garbage files in object storage
@@ -178,6 +183,12 @@ func (gc *gcPauseRecords) Delete(ticket string) {
 // merely share its ticket untouched.
 func (gc *gcPauseRecords) DeleteByID(id int64) {
 	gc.deleteMatching(func(r gcPauseRecord) bool { return r.id == id })
+}
+
+// Clear drops every record, whatever ticket it holds. It backs the ticket-less
+// resume, which has no ticket to match on and means "GC must not be paused".
+func (gc *gcPauseRecords) Clear() {
+	gc.deleteMatching(func(gcPauseRecord) bool { return true })
 }
 
 // deleteMatching rebuilds the heap without the matching records, dropping
@@ -367,6 +378,7 @@ func (gc *garbageCollector) work(ctx context.Context) {
 	go func() {
 		defer gc.wg.Done()
 		gc.runRecycleTaskWithPauser(ctx, "meta", gc.option.checkInterval, func(ctx context.Context, signal <-chan gcCmd) {
+			gc.recycleDataViews(ctx, signal)
 			gc.recycleDroppedSegments(ctx, signal)
 			gc.recycleChannelCPMeta(ctx, signal)
 			gc.recycleUnusedIndexes(ctx, signal)
@@ -511,6 +523,20 @@ func (gc *garbageCollector) rollbackPause(cmd gcCmd, recordID int64) {
 }
 
 func (gc *garbageCollector) resume(cmd gcCmd) {
+	// A resume carrying no ticket is the pre collection level GC control
+	// semantic: release every outstanding pause. Pauses issued through the proxy
+	// route always carry a generated ticket, so a ticket-scoped delete would
+	// match nothing here and leave GC paused while reporting success.
+	if cmd.ticket == "" {
+		gc.pauseUntil.Clear()
+		gc.pausedCollection.Range(func(collectionID int64, _ *gcPauseRecords) bool {
+			gc.pausedCollection.Remove(collectionID)
+			return true
+		})
+		mlog.Info(gc.ctx, "garbage collection resumed", mlog.Bool("stillPaused", false))
+		return
+	}
+
 	// reset to zero value
 	var afterResume time.Time
 	if cmd.collectionID <= 0 {
@@ -832,6 +858,33 @@ func (gc *garbageCollector) recycleUnusedBinLogWithChecker(ctx context.Context, 
 	metrics.GarbageCollectorFileScanDuration.
 		WithLabelValues(paramtable.GetStringNodeID(), label).
 		Observe(float64(cost.Milliseconds()))
+}
+
+func (gc *garbageCollector) recycleDataViews(ctx context.Context, signal <-chan gcCmd) {
+	if gc.meta == nil || gc.option.dataViewGC == nil {
+		return
+	}
+	start := time.Now()
+	logger := mlog.With(mlog.String("gcName", "recycleDataViews"), mlog.Time("startAt", start))
+	logger.Info(ctx, "start recycleDataViews")
+	defer func() { logger.Info(ctx, "recycleDataViews done", mlog.Duration("timeCost", time.Since(start))) }()
+
+	for _, collection := range gc.meta.GetCollections() {
+		if ctx.Err() != nil {
+			return
+		}
+		gc.ackSignal(signal)
+
+		collectionID := collection.ID
+		if gc.collectionGCPaused(collectionID) {
+			logger.Info(ctx, "skip DataView GC since collection is paused", mlog.FieldCollectionID(collectionID))
+			continue
+		}
+
+		if err := gc.option.dataViewGC.GarbageCollect(ctx, collectionID, 1); err != nil {
+			logger.Warn(ctx, "DataView GC failed", mlog.FieldCollectionID(collectionID), mlog.Err(err))
+		}
+	}
 }
 
 func (gc *garbageCollector) checkDroppedSegmentGC(segment *SegmentInfo,

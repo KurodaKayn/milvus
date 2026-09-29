@@ -2254,6 +2254,85 @@ func (s *GarbageCollectorSuite) TestPauseResume() {
 		s.Zero(gc.pauseUntil.PauseUntil())
 	})
 
+	s.Run("resume_without_ticket_releases_every_pause", func() {
+		gc := newGarbageCollector(s.meta, newMockHandler(), GcOption{
+			cli:              s.cli,
+			enabled:          true,
+			checkInterval:    time.Millisecond * 10,
+			scanInterval:     time.Hour * 7 * 24,
+			missingTolerance: time.Hour * 24,
+			dropTolerance:    time.Hour * 24,
+		})
+
+		gc.start()
+		defer gc.close()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		s.NoError(gc.Pause(ctx, -1, "ticket-1", time.Minute))
+		s.NoError(gc.Pause(ctx, -1, "ticket-2", time.Minute))
+		s.NoError(gc.Pause(ctx, 100, "ticket-3", time.Minute))
+		s.True(gc.GetStatus().IsPaused)
+		s.True(gc.collectionGCPaused(100))
+
+		// a caller predating collection level GC control sends no ticket, it means
+		// "GC must not be paused anymore"
+		s.NoError(gc.Resume(ctx, -1, ""))
+
+		s.Zero(gc.pauseUntil.PauseUntil())
+		s.False(gc.GetStatus().IsPaused)
+		s.False(gc.collectionGCPaused(100))
+	})
+
+	s.Run("resume_with_ticket_keeps_other_pauses", func() {
+		gc := newGarbageCollector(s.meta, newMockHandler(), GcOption{
+			cli:              s.cli,
+			enabled:          true,
+			checkInterval:    time.Millisecond * 10,
+			scanInterval:     time.Hour * 7 * 24,
+			missingTolerance: time.Hour * 24,
+			dropTolerance:    time.Hour * 24,
+		})
+
+		gc.start()
+		defer gc.close()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		s.NoError(gc.Pause(ctx, -1, "ticket-1", time.Minute))
+		s.NoError(gc.Pause(ctx, -1, "ticket-2", time.Minute))
+
+		s.NoError(gc.Resume(ctx, -1, "ticket-1"))
+		s.True(gc.GetStatus().IsPaused)
+
+		s.NoError(gc.Resume(ctx, -1, "ticket-2"))
+		s.False(gc.GetStatus().IsPaused)
+	})
+
+	s.Run("resume_with_ticket_keeps_other_collection_pauses", func() {
+		gc := newGarbageCollector(s.meta, newMockHandler(), GcOption{
+			cli:              s.cli,
+			enabled:          true,
+			checkInterval:    time.Millisecond * 10,
+			scanInterval:     time.Hour * 7 * 24,
+			missingTolerance: time.Hour * 24,
+			dropTolerance:    time.Hour * 24,
+		})
+
+		gc.start()
+		defer gc.close()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		s.NoError(gc.Pause(ctx, 100, "ticket-1", time.Minute))
+		s.NoError(gc.Pause(ctx, 200, "ticket-2", time.Minute))
+
+		s.NoError(gc.Resume(ctx, 100, "ticket-1"))
+
+		s.False(gc.collectionGCPaused(100))
+		s.True(gc.collectionGCPaused(200))
+	})
+
 	s.Run("pause_before_until", func() {
 		gc := newGarbageCollector(s.meta, newMockHandler(), GcOption{
 			cli:              s.cli,
@@ -6052,4 +6131,91 @@ func TestParseIndexV1FilePath(t *testing.T) {
 			assert.Error(t, err)
 		})
 	}
+}
+
+// fakeDataViewGC records the collections and retainLatest values it was asked
+// to garbage collect, implementing DataViewGarbageCollector.
+type fakeDataViewGC struct {
+	mu        sync.Mutex
+	collected []int64
+	retains   []int
+	err       error
+}
+
+func (f *fakeDataViewGC) GarbageCollect(_ context.Context, collectionID int64, retainLatest int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.collected = append(f.collected, collectionID)
+	f.retains = append(f.retains, retainLatest)
+	return f.err
+}
+
+func (f *fakeDataViewGC) snapshot() ([]int64, []int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int64(nil), f.collected...), append([]int(nil), f.retains...)
+}
+
+// TestGarbageCollector_recycleDataViews verifies the DataView GC sweep: every
+// non-paused collection is garbage collected with retainLatest=1, paused
+// collections are skipped, GC errors are tolerated (logged, not fatal), a
+// canceled context stops the sweep, and a nil collector is a no-op.
+func TestGarbageCollector_recycleDataViews(t *testing.T) {
+	meta, err := newMemoryMeta(t)
+	require.NoError(t, err)
+	for _, id := range []int64{100, 101, 102} {
+		meta.AddCollection(&collectionInfo{ID: id})
+	}
+
+	t.Run("nil dataViewGC is a no-op", func(t *testing.T) {
+		gc := newGarbageCollector(meta, nil, GcOption{})
+		require.NotPanics(t, func() {
+			gc.recycleDataViews(context.Background(), nil)
+		})
+	})
+
+	t.Run("collects every non-paused collection with retainLatest=1", func(t *testing.T) {
+		fake := &fakeDataViewGC{}
+		gc := newGarbageCollector(meta, nil, GcOption{dataViewGC: fake})
+		gc.recycleDataViews(context.Background(), nil)
+		collected, retains := fake.snapshot()
+		assert.ElementsMatch(t, []int64{100, 101, 102}, collected)
+		for _, r := range retains {
+			assert.Equal(t, 1, r)
+		}
+	})
+
+	t.Run("skips paused collections", func(t *testing.T) {
+		fake := &fakeDataViewGC{}
+		gc := newGarbageCollector(meta, nil, GcOption{dataViewGC: fake})
+		// Pause collection 101 far into the future so collectionGCPaused is true.
+		records := NewGCPauseRecords()
+		_, err := records.Insert("ticket", time.Now().Add(time.Hour))
+		require.NoError(t, err)
+		gc.pausedCollection.Insert(101, records)
+
+		gc.recycleDataViews(context.Background(), nil)
+		collected, _ := fake.snapshot()
+		assert.ElementsMatch(t, []int64{100, 102}, collected)
+	})
+
+	t.Run("tolerates GC errors", func(t *testing.T) {
+		fake := &fakeDataViewGC{err: errors.New("injected data view gc failure")}
+		gc := newGarbageCollector(meta, nil, GcOption{dataViewGC: fake})
+		require.NotPanics(t, func() {
+			gc.recycleDataViews(context.Background(), nil)
+		})
+		collected, _ := fake.snapshot()
+		assert.ElementsMatch(t, []int64{100, 101, 102}, collected)
+	})
+
+	t.Run("canceled context stops the sweep", func(t *testing.T) {
+		fake := &fakeDataViewGC{}
+		gc := newGarbageCollector(meta, nil, GcOption{dataViewGC: fake})
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		gc.recycleDataViews(ctx, nil)
+		collected, _ := fake.snapshot()
+		assert.Empty(t, collected)
+	})
 }

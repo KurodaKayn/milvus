@@ -137,6 +137,13 @@ func (suite *ServerSuite) SetupTest() {
 	err = suite.server.Start()
 	suite.NoError(err)
 
+	// DDL callbacks are registered by mixCoord.enableExternalAccess in
+	// production, which the unit test ServerSuite bypasses; register them here
+	// so LoadCollection/alter-load-config broadcasts can find their ack
+	// callbacks (same as ServiceSuite.SetupTest).
+	registry.ResetRegistration()
+	RegisterDDLCallbacks(suite.server)
+
 	for i := range suite.nodes {
 		suite.nodes[i] = mocks.NewMockQueryNode(suite.T(), suite.server.etcdCli, int64(i))
 		err := suite.nodes[i].Start()
@@ -662,7 +669,10 @@ func (suite *ServerSuite) expectGetRecoverInfo(collection int64) {
 			})
 		}
 	}
+	suite.broker.EXPECT().GetRecoveryInfoV2(mock.Anything, collection, mock.Anything).Maybe().Return(vChannels, segmentInfos, nil)
+	suite.broker.EXPECT().GetRecoveryInfoV2(mock.Anything, collection, mock.Anything, mock.Anything).Maybe().Return(vChannels, segmentInfos, nil)
 	suite.broker.EXPECT().GetRecoveryInfoV2(mock.Anything, collection).Maybe().Return(vChannels, segmentInfos, nil)
+	suite.broker.EXPECT().GetIndexInfo(mock.Anything, collection, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Maybe().Return(map[int64][]*querypb.FieldIndexInfo{}, nil)
 }
 
 func (suite *ServerSuite) expectLoadAndReleasePartitions(querynode *mocks.MockQueryNode) {

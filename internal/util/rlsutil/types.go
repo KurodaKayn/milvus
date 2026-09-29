@@ -54,6 +54,24 @@ func NewDoubleTagValue(value float64) TagValue {
 	return TagValue{Kind: TagValueKindDouble, DoubleValue: value}
 }
 
+// PrincipalTagsSize returns the logical bytes occupied by one principal and
+// its tags. Numeric values use their fixed-width in-memory representation.
+func PrincipalTagsSize(principalName string, tags map[string]TagValue) (int64, error) {
+	size := int64(len(principalName))
+	for key, value := range tags {
+		size += int64(len(key))
+		switch value.Kind {
+		case TagValueKindString:
+			size += int64(len(value.StringValue))
+		case TagValueKindInt64, TagValueKindDouble:
+			size += 8
+		default:
+			return 0, merr.WrapErrServiceInternalMsg("RLS principal tag %q has unsupported internal value type", key)
+		}
+	}
+	return size, nil
+}
+
 func TagsFromJSON(payload string) (map[string]TagValue, error) {
 	decoder := json.NewDecoder(strings.NewReader(payload))
 	decoder.UseNumber()
@@ -85,6 +103,8 @@ func TagsFromJSON(payload string) (map[string]TagValue, error) {
 					tags[key] = NewInt64TagValue(value)
 					continue
 				}
+				// encoding/json may serialize an integral double without a decimal
+				// point. Preserve values outside int64 as doubles on round trip.
 				doubleValue, doubleErr := strconv.ParseFloat(typed.String(), 64)
 				if doubleErr != nil {
 					return nil, merr.WrapErrParameterInvalidMsg("RLS principal tag %q has an invalid numeric value", key)
@@ -118,7 +138,11 @@ func TagsToJSON(tags map[string]TagValue) (string, error) {
 		case TagValueKindInt64:
 			values[key] = value.Int64Value
 		case TagValueKindDouble:
-			values[key] = value.DoubleValue
+			encoded := strconv.FormatFloat(value.DoubleValue, 'g', -1, 64)
+			if !strings.ContainsAny(encoded, ".eE") {
+				encoded += ".0"
+			}
+			values[key] = json.Number(encoded)
 		default:
 			return "", merr.WrapErrServiceInternalMsg("RLS principal tag %q has unsupported internal value type", key)
 		}
@@ -128,17 +152,6 @@ func TagsToJSON(tags map[string]TagValue) (string, error) {
 		return "", merr.WrapErrDataIntegrity(err, "encode RLS principal tags")
 	}
 	return string(payload), nil
-}
-
-func CloneTags(tags map[string]TagValue) map[string]TagValue {
-	if tags == nil {
-		return nil
-	}
-	cloned := make(map[string]TagValue, len(tags))
-	for key, value := range tags {
-		cloned[key] = value
-	}
-	return cloned
 }
 
 type PolicyType int32

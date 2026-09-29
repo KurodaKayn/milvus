@@ -32,8 +32,10 @@ import (
 	internalhttp "github.com/milvus-io/milvus/internal/http"
 	"github.com/milvus-io/milvus/internal/proxy/channelmgr"
 	"github.com/milvus-io/milvus/internal/proxy/connection"
+	"github.com/milvus-io/milvus/internal/proxy/rls"
 	"github.com/milvus-io/milvus/internal/proxy/scheduler"
 	"github.com/milvus-io/milvus/internal/proxy/shardclient"
+	"github.com/milvus-io/milvus/internal/proxy/taskmodel"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/adminauth"
 	"github.com/milvus-io/milvus/internal/util/dependency"
@@ -130,6 +132,13 @@ type Proxy struct {
 	slowQueries *expirable.LRU[Timestamp, *metricsinfo.SlowQuery]
 }
 
+// Compile-time assertions that *Proxy satisfies the task-model contracts the
+// extracted task packages consume through the composition root.
+var (
+	_ taskmodel.TaskNode    = (*Proxy)(nil)
+	_ taskmodel.QueryRunner = (*Proxy)(nil)
+)
+
 // NewProxy returns a Proxy struct.
 func NewProxy(ctx context.Context, factory dependency.Factory) (*Proxy, error) {
 	rand.Seed(time.Now().UnixNano())
@@ -182,6 +191,36 @@ func (node *Proxy) GetMetaCache() Cache {
 	return node.getMetaCache()
 }
 
+// MixCoord returns the MixCoord client consumed by concrete tasks through the
+// taskmodel.TaskNode contract.
+func (node *Proxy) MixCoord() types.MixCoordClient {
+	return node.mixCoord
+}
+
+// LBPolicy returns the replica load-balance policy consumed by concrete tasks
+// through the taskmodel.TaskNode contract.
+func (node *Proxy) LBPolicy() shardclient.LBPolicy {
+	return node.lbPolicy
+}
+
+// ShardMgr returns the shard client manager consumed by concrete tasks through
+// the taskmodel.TaskNode contract.
+func (node *Proxy) ShardMgr() shardclient.ShardClientMgr {
+	return node.shardMgr
+}
+
+// ChMgr returns the channel manager consumed by concrete tasks through the
+// taskmodel.TaskNode contract.
+func (node *Proxy) ChMgr() channelmgr.ChannelsMgr {
+	return node.chMgr
+}
+
+// TsoAllocator returns the timestamp allocator consumed by concrete tasks
+// through the taskmodel.TaskNode contract.
+func (node *Proxy) TsoAllocator() taskmodel.TsoAllocator {
+	return node.tsoAllocator
+}
+
 // IsDQLQueueFull reports whether the next DQL enqueue would be rejected with
 // TooManyRequests. The REST layer probes it (via interface assertion, like
 // GetMetaCache) to reject search/query before paying for body decoding.
@@ -194,6 +233,7 @@ func (node *Proxy) Register() error {
 	node.session.Register()
 	metrics.NumNodes.WithLabelValues(paramtable.GetStringNodeID(), typeutil.ProxyRole).Inc()
 	mlog.Info(node.ctx, "Proxy Register Finished")
+
 	// TODO Reset the logger
 	// Params.initLogCfg()
 	return nil
@@ -307,6 +347,12 @@ func (node *Proxy) Init() error {
 	node.enableComplexDeleteLimit = Params.QuotaConfig.ComplexDeleteLimitEnable.GetAsBool()
 	node.metricsCacheManager = metricsinfo.NewMetricsCacheManager()
 	mlog.Debug(node.ctx, "create metrics cache manager done", mlog.String("role", typeutil.ProxyRole))
+
+	if err := rls.Init(node.ctx, node.mixCoord); err != nil {
+		mlog.Warn(node.ctx, "failed to init RLS metadata manager", mlog.String("role", typeutil.ProxyRole), mlog.Err(err))
+		return err
+	}
+	mlog.Debug(node.ctx, "init RLS metadata manager done", mlog.String("role", typeutil.ProxyRole))
 
 	node.managementRootVerifier = newManagementRootVerifier(node.mixCoord)
 	internalhttp.RegisterManagementVerifier(internalhttp.VerifierSlotProxy, node.managementRootVerifier.Verify)

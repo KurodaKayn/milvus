@@ -63,15 +63,21 @@ type mixCoordImpl struct {
 	tikvCli *txnkv.Client
 	address string
 
-	proxyCreator       proxyutil.ProxyCreator
-	proxyWatcher       *proxyutil.ProxyWatcher
-	proxyClientManager proxyutil.ProxyClientManagerInterface
+	proxyCreator proxyutil.ProxyCreator
+	proxyWatcher *proxyutil.ProxyWatcher
 
 	metricsCacheManager *metricsinfo.MetricsCacheManager
 	stateCode           atomic.Int32
-	initOnce            sync.Once
-	startOnce           sync.Once
-	session             *sessionutil.Session
+
+	// onActive holds callbacks to run once this replica becomes ACTIVE -
+	// after initInternal has built the sub-coordinators and the state moved
+	// to Healthy. A standby replica never fires them; see OnActive.
+	onActiveMu sync.Mutex
+	onActive   []func()
+	activated  bool
+	initOnce   sync.Once
+	startOnce  sync.Once
+	session    *sessionutil.Session
 
 	factory dependency.Factory
 
@@ -92,6 +98,8 @@ type mixCoordImpl struct {
 
 	// file resource observer
 	fileResourceObserver *FileResourceObserver
+
+	recoveryBarrier *recoveryBarrier
 }
 
 func NewMixCoordServer(c context.Context, factory dependency.Factory) (*mixCoordImpl, error) {
@@ -100,6 +108,9 @@ func NewMixCoordServer(c context.Context, factory dependency.Factory) (*mixCoord
 	queryCoordServer, _ := querycoordv2.NewQueryCoord(c)
 	dataCoordServer := datacoord.CreateServer(c, factory)
 
+	recoveryBarrier := newRecoveryBarrier()
+	dataCoordServer.SetDataViewCollectionRecoveryValidator(rootCoordServer.ValidateDataViewCollectionForRecovery)
+
 	return &mixCoordImpl{
 		ctx:              ctx,
 		cancel:           cancel,
@@ -107,6 +118,7 @@ func NewMixCoordServer(c context.Context, factory dependency.Factory) (*mixCoord
 		queryCoordServer: queryCoordServer,
 		datacoordServer:  dataCoordServer,
 		factory:          factory,
+		recoveryBarrier:  recoveryBarrier,
 	}, nil
 }
 
@@ -156,7 +168,7 @@ func (s *mixCoordImpl) activateFunc() error {
 		return err
 	}
 	mlog.Info(s.ctx, "mixCoord startup success", mlog.String("address", s.session.GetAddress()))
-	s.startAndUpdateHealthy()
+	s.enableExternalAccess()
 	return err
 }
 
@@ -165,9 +177,6 @@ func (s *mixCoordImpl) initInternal() error {
 	s.datacoordServer.SetMixCoord(s)
 	s.queryCoordServer.SetMixCoord(s)
 	s.fileResourceObserver = NewFileResourceObserver(s.ctx)
-
-	// Register WAL callbacks
-	RegisterWALCallbacks(s)
 
 	if err := s.streamingCoord.Start(s.ctx, s.fileResourceObserver); err != nil {
 		mlog.Error(s.ctx, "streamCoord start failed", mlog.Err(err))
@@ -199,16 +208,12 @@ func (s *mixCoordImpl) initInternal() error {
 	internalhttp.RegisterManagementVerifier(internalhttp.VerifierSlotCoordinator, s.rootCredentialVerifier.Verify)
 
 	// DataCoord and QueryCoord are independent of each other;
-	// both only depend on RootCoord being ready. Initialize and start them in parallel.
+	// both only depend on RootCoord being ready. Recover them in parallel first.
 	g, _ := errgroup.WithContext(s.ctx)
 	g.Go(func() error {
 		s.datacoordServer.SetFileResourceObserver(s.fileResourceObserver)
 		if err := s.datacoordServer.Init(); err != nil {
 			mlog.Error(s.ctx, "dataCoord init failed", mlog.Err(err))
-			return err
-		}
-		if err := s.datacoordServer.Start(); err != nil {
-			mlog.Error(s.ctx, "dataCoord start failed", mlog.Err(err))
 			return err
 		}
 		return nil
@@ -219,6 +224,21 @@ func (s *mixCoordImpl) initInternal() error {
 			mlog.Error(s.ctx, "queryCoord init failed", mlog.Err(err))
 			return err
 		}
+		return nil
+	})
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	g, _ = errgroup.WithContext(s.ctx)
+	g.Go(func() error {
+		if err := s.datacoordServer.Start(); err != nil {
+			mlog.Error(s.ctx, "dataCoord start failed", mlog.Err(err))
+			return err
+		}
+		return nil
+	})
+	g.Go(func() error {
 		if err := s.queryCoordServer.Start(); err != nil {
 			mlog.Error(s.ctx, "queryCoord start failed", mlog.Err(err))
 			return err
@@ -231,6 +251,24 @@ func (s *mixCoordImpl) initInternal() error {
 
 	s.fileResourceObserver.Start()
 	return nil
+}
+
+func (s *mixCoordImpl) enableExternalAccess() {
+	// Register the callback dependencies before RootCoord callbacks, which may
+	// invoke DataCoord or QueryCoord callbacks while handling collection DDLs.
+	datacoord.RegisterDDLCallbacks(s.datacoordServer)
+	querycoordv2.RegisterDDLCallbacks(s.queryCoordServer)
+	rootcoord.RegisterDDLCallbacks(s.rootcoordServer)
+	RegisterWALCallbacks(s)
+
+	// Publish Healthy only after every callback is registered. The distributed
+	// server waits on the barrier below before it starts serving external RPCs.
+	s.startAndUpdateHealthy()
+	s.recoveryBarrier.Ready()
+}
+
+func (s *mixCoordImpl) WaitForRecovery(ctx context.Context) error {
+	return s.recoveryBarrier.Wait(ctx)
 }
 
 func (s *mixCoordImpl) initKVCreator() {
@@ -261,6 +299,32 @@ func (s *mixCoordImpl) startAndUpdateHealthy() {
 	s.UpdateStateCode(commonpb.StateCode_Healthy)
 	s.startPosixCleanupTask()
 	RegisterMgrRoute(s)
+
+	s.onActiveMu.Lock()
+	s.activated = true
+	fns := s.onActive
+	s.onActive = nil
+	s.onActiveMu.Unlock()
+	for _, fn := range fns {
+		fn()
+	}
+}
+
+// OnActive runs fn once this replica is ACTIVE: sub-coordinators initialized,
+// state Healthy. A callback registered after activation runs immediately; one
+// registered on a replica that stays standby never runs, which is the point -
+// work hung off this hook (a coordinator engine doing resource-group
+// accounting, say) must run on exactly one replica, and before activation the
+// sub-coordinators it would read are not initialized at all.
+func (s *mixCoordImpl) OnActive(fn func()) {
+	s.onActiveMu.Lock()
+	if s.activated {
+		s.onActiveMu.Unlock()
+		fn()
+		return
+	}
+	s.onActive = append(s.onActive, fn)
+	s.onActiveMu.Unlock()
 }
 
 func (s *mixCoordImpl) IsServerActive(serverID int64) bool {
@@ -285,6 +349,15 @@ func (s *mixCoordImpl) fetchRootHash(ctx context.Context) (string, error) {
 		return "", merr.Wrap(err, "GetCredential failed")
 	}
 	return adminauth.RootHashFromResponse(resp)
+}
+
+func (s *mixCoordImpl) CreateCollectionDataView(ctx context.Context, collectionID int64, vchannels []string) error {
+	_, err := s.datacoordServer.CreateCollectionDataView(ctx, collectionID, vchannels)
+	return err
+}
+
+func (s *mixCoordImpl) DropCollectionDataView(ctx context.Context, collectionID int64) error {
+	return s.datacoordServer.DropCollectionDataView(ctx, collectionID)
 }
 
 func (s *mixCoordImpl) checkExpiredPOSIXDIR() {
@@ -504,6 +577,10 @@ func (s *mixCoordImpl) ShowCollections(ctx context.Context, req *milvuspb.ShowCo
 
 func (s *mixCoordImpl) ShowCollectionIDs(ctx context.Context, req *rootcoordpb.ShowCollectionIDsRequest) (*rootcoordpb.ShowCollectionIDsResponse, error) {
 	return s.rootcoordServer.ShowCollectionIDs(ctx, req)
+}
+
+func (s *mixCoordImpl) GetRLSMetadata(ctx context.Context, req *rootcoordpb.GetRLSMetadataRequest) (*rootcoordpb.GetRLSMetadataResponse, error) {
+	return s.rootcoordServer.GetRLSMetadata(ctx, req)
 }
 
 func (s *mixCoordImpl) AlterCollection(ctx context.Context, req *milvuspb.AlterCollectionRequest) (*commonpb.Status, error) {
@@ -1282,8 +1359,8 @@ func (s *mixCoordImpl) AllocSegment(ctx context.Context, req *datapb.AllocSegmen
 	return s.datacoordServer.AllocSegment(ctx, req)
 }
 
-func (s *mixCoordImpl) NotifyDropPartition(ctx context.Context, channel string, partitionIDs []int64) error {
-	return s.datacoordServer.NotifyDropPartition(ctx, channel, partitionIDs)
+func (s *mixCoordImpl) NotifyDropPartition(ctx context.Context, channel string, collectionID int64, partitionIDs []int64) error {
+	return s.datacoordServer.NotifyDropPartition(ctx, channel, collectionID, partitionIDs)
 }
 
 // RegisterStreamingCoordGRPCService registers the grpc service of streaming coordinator.

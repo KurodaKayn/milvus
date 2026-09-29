@@ -283,7 +283,7 @@ ApplyValidMaskForCandidates(ValidityView validity,
 class Expr : public std::enable_shared_from_this<Expr> {
  public:
     Expr(DataType type,
-         const std::vector<std::shared_ptr<Expr>>&& inputs,
+         std::vector<std::shared_ptr<Expr>>&& inputs,
          const std::string& name,
          milvus::OpContext* op_ctx)
         : type_(type),
@@ -436,12 +436,12 @@ using ExprPtr = std::shared_ptr<milvus::exec::Expr>;
  */
 class SegmentExpr : public Expr {
  public:
-    SegmentExpr(const std::vector<ExprPtr>&& input,
+    SegmentExpr(std::vector<ExprPtr>&& input,
                 const std::string& name,
                 milvus::OpContext* op_ctx,
                 const segcore::SegmentInternalInterface* segment,
                 const FieldId field_id,
-                const std::vector<std::string> nested_path,
+                const std::vector<std::string>& nested_path,
                 const DataType value_type,
                 int64_t active_count,
                 int64_t batch_size,
@@ -601,6 +601,38 @@ class SegmentExpr : public Expr {
                    : static_cast<int64_t>(chunk) * size_per_chunk_ + chunk_pos;
     }
 
+    ExprExecPath
+    GetExecPath() const {
+        EnsureExecPathDetermined();
+        return exec_path_;
+    }
+
+    const segcore::SegmentInternalInterface*
+    GetSegment() const {
+        return segment_;
+    }
+
+    int64_t
+    GetActiveCount() const {
+        return active_count_;
+    }
+
+    // Opt-in contract for the composition-based RawData expression-cache
+    // adapter. An undecorated expression keeps its original execution hot path.
+    virtual bool
+    SupportsRawExprCache() const {
+        return false;
+    }
+
+    std::string
+    GetSignatureForRawExprCache() const {
+        // Null-rejecting scans may omit validity for skipped chunks. Keep
+        // their entries separate from evaluations that must preserve UNKNOWN,
+        // and namespace both modes away from other execution paths' keys.
+        return fmt::format(
+            "raw:null_rejecting={}:{}", null_rejecting_, ToString());
+    }
+
     void
     AdvanceDataChunkCursor(int64_t rows) {
         AssertInfo(
@@ -649,6 +681,66 @@ class SegmentExpr : public Expr {
             AdvanceDataChunkCursor(rows);
         }
         current_data_global_pos_ += rows;
+    }
+
+    // Apply field nullability to an already-initialized valid_result bitmap.
+    // Pinned path reads the column from the frozen snapshot so the validity
+    // data comes from the same generation as the chunk boundaries above.
+    void
+    ApplyFieldValidData(milvus::OpContext* op_ctx,
+                        FieldId field_id,
+                        int64_t chunk_id,
+                        int64_t offset,
+                        int64_t size,
+                        TargetBitmapView valid_result) const {
+        if (size == 0) {
+            return;
+        }
+        if (snapshot_) {
+            auto column = snapshot_->GetDataScanResources(field_id).first;
+            AssertInfo(column != nullptr,
+                       "field {} column must exist when validity is requested",
+                       field_id.get());
+            column->ApplyValidDataInChunk(
+                op_ctx, chunk_id, offset, size, valid_result);
+        } else {
+            segment_->ApplyFieldValidData(
+                op_ctx, field_id, chunk_id, offset, size, valid_result);
+        }
+    }
+
+    // Apply field nullability for segment-level row offsets. Pinned path reads
+    // the column from the frozen snapshot, same generation as all reads above.
+    void
+    ApplyFieldValidDataByOffsets(milvus::OpContext* op_ctx,
+                                 FieldId field_id,
+                                 const int64_t* offsets,
+                                 int64_t count,
+                                 TargetBitmapView valid_result) const {
+        if (count == 0) {
+            return;
+        }
+        if (snapshot_) {
+            auto column = snapshot_->GetDataScanResources(field_id).first;
+            AssertInfo(column != nullptr,
+                       "field {} column must exist when validity is requested",
+                       field_id.get());
+            if (!column->IsNullable()) {
+                return;
+            }
+            column->BulkIsValid(
+                op_ctx,
+                [&valid_result](bool is_valid, size_t i) {
+                    if (!is_valid) {
+                        valid_result[i] = false;
+                    }
+                },
+                offsets,
+                count);
+        } else {
+            segment_->ApplyFieldValidDataByOffsets(
+                op_ctx, field_id, offsets, count, valid_result);
+        }
     }
 
     // Legacy Chunk readers advance current_data_chunk_ and
@@ -857,21 +949,24 @@ class SegmentExpr : public Expr {
         if (!ExprResCacheManager::IsEnabled() || segment_ == nullptr) {
             return false;
         }
-        if (ExprResCacheManager::Instance().GetMode() == CacheMode::Disk &&
-            segment_->type() != SegmentType::Sealed) {
-            return false;
-        }
-        ExprResCacheManager::Key key{segment_->get_segment_id(),
-                                     this->ToString()};
-        ExprResCacheManager::Value got;
-        got.active_count = active_count_;
-        if (ExprResCacheManager::Instance().Get(key, got)) {
-            cached_index_chunk_res_ = got.result;
-            cached_index_chunk_valid_res_ = got.valid_result;
-            cached_index_chunk_id_ = 0;
-            return true;
-        }
-        return false;
+        bool cache_hit = false;
+        RunExprCacheBestEffort([&]() {
+            auto& manager = ExprResCacheManager::Instance();
+            if (!manager.CanCacheSegment(segment_->type())) {
+                return;
+            }
+            ExprResCacheManager::Key key{segment_->get_segment_id(),
+                                         this->ToString()};
+            ExprResCacheManager::Value got;
+            got.active_count = active_count_;
+            if (manager.Get(key, got)) {
+                cached_index_chunk_res_ = got.result;
+                cached_index_chunk_valid_res_ = got.valid_result;
+                cached_index_chunk_id_ = 0;
+                cache_hit = true;
+            }
+        });
+        return cache_hit;
     }
 
     // Put the current cached_index_chunk_res_ into ExprResCache.
@@ -881,21 +976,23 @@ class SegmentExpr : public Expr {
         if (!ExprResCacheManager::IsEnabled() || segment_ == nullptr) {
             return;
         }
-        if (ExprResCacheManager::Instance().GetMode() == CacheMode::Disk &&
-            segment_->type() != SegmentType::Sealed) {
-            return;
-        }
         if (!cached_index_chunk_res_ || !cached_index_chunk_valid_res_) {
             return;
         }
-        ExprResCacheManager::Key key{segment_->get_segment_id(),
-                                     this->ToString()};
-        ExprResCacheManager::Value v;
-        v.result = cached_index_chunk_res_;
-        v.valid_result = cached_index_chunk_valid_res_;
-        v.active_count = active_count_;
-        v.eval_duration_us = eval_duration_us;
-        ExprResCacheManager::Instance().Put(key, v);
+        RunExprCacheBestEffort([&]() {
+            auto& manager = ExprResCacheManager::Instance();
+            if (!manager.CanCacheSegment(segment_->type())) {
+                return;
+            }
+            ExprResCacheManager::Key key{segment_->get_segment_id(),
+                                         this->ToString()};
+            ExprResCacheManager::Value v;
+            v.result = cached_index_chunk_res_;
+            v.valid_result = cached_index_chunk_valid_res_;
+            v.active_count = active_count_;
+            v.eval_duration_us = eval_duration_us;
+            manager.Put(key, v);
+        });
     }
 
     using CacheClock = std::chrono::steady_clock;
@@ -2679,12 +2776,12 @@ class SegmentExpr : public Expr {
             if (size == 0) {
                 continue;
             }
-            segment_->ApplyFieldValidData(op_ctx_,
-                                          field_id_,
-                                          chunk_id,
-                                          0,
-                                          size,
-                                          valid_result.view() + processed_size);
+            ApplyFieldValidData(op_ctx_,
+                                field_id_,
+                                chunk_id,
+                                0,
+                                size,
+                                valid_result.view() + processed_size);
             processed_size += size;
         }
         AssertInfo(processed_size == row_count,
@@ -2752,7 +2849,7 @@ class SegmentExpr : public Expr {
 
             auto cached = ExprCacheHelper::GetOrCompute(
                 segment_,
-                this->ToString(),
+                [this]() { return this->ToString(); },
                 active_count_,
                 [&]() -> ExprCacheHelper::ComputeResult {
                     prepare_index();
@@ -2780,16 +2877,20 @@ class SegmentExpr : public Expr {
                     if (json_value_type.has_value()) {
                         const auto family =
                             static_cast<unsigned int>(json_value_type.value());
-                        const auto signature = fmt::format(
-                            "json-flat-validity:v1:field={}:path-length={}:"
-                            "path={}:family={}",
-                            field_id_.get(),
-                            json_pointer.size(),
-                            json_pointer,
-                            family);
                         if (ExprResCacheManager::IsEnabled()) {
                             auto validity = ExprCacheHelper::GetOrComputeBitmap(
-                                segment_, signature, active_count_, [&]() {
+                                segment_,
+                                [&]() {
+                                    return fmt::format(
+                                        "json-flat-validity:v1:field={}:"
+                                        "path-length={}:path={}:family={}",
+                                        field_id_.get(),
+                                        json_pointer.size(),
+                                        json_pointer,
+                                        family);
+                                },
+                                active_count_,
+                                [&]() {
                                     return executor->ExactPathExists(
                                         json_value_type.value());
                                 });
@@ -2979,12 +3080,11 @@ class SegmentExpr : public Expr {
 
         auto apply_field_valid_data = [&]() {
             std::vector<int64_t> offsets(input.begin(), input.end());
-            segment_->ApplyFieldValidDataByOffsets(
-                op_ctx_,
-                field_id_,
-                offsets.data(),
-                batch_size,
-                TargetBitmapView(valid_result));
+            ApplyFieldValidDataByOffsets(op_ctx_,
+                                         field_id_,
+                                         offsets.data(),
+                                         batch_size,
+                                         TargetBitmapView(valid_result));
         };
 
         if constexpr (std::is_same_v<T, VectorArray>) {
@@ -3073,12 +3173,12 @@ class SegmentExpr : public Expr {
             if (size == 0) {
                 continue;
             }
-            segment_->ApplyFieldValidData(op_ctx_,
-                                          field_id_,
-                                          i,
-                                          data_pos,
-                                          size,
-                                          valid_result + processed_size);
+            ApplyFieldValidData(op_ctx_,
+                                field_id_,
+                                i,
+                                data_pos,
+                                size,
+                                valid_result + processed_size);
 
             processed_size += size;
             if (processed_size >= expected_rows) {
@@ -3412,10 +3512,7 @@ class SegmentExpr : public Expr {
 
     bool
     HasJsonStats(FieldId field_id) const {
-        return segment_->type() == SegmentType::Sealed &&
-               static_cast<const segcore::SegmentSealed*>(segment_)
-                       ->GetJsonStats(op_ctx_, field_id)
-                       .get() != nullptr;
+        return segment_->HasJsonStats(field_id);
     }
 
     static bool
@@ -3587,20 +3684,28 @@ class SegmentExpr : public Expr {
                       prefetch_pool) override {
         auto self = std::static_pointer_cast<SegmentExpr>(shared_from_this());
         prefetch_future_.emplace(folly::via(prefetch_pool.get(), [self]() {
-            if (self->op_ctx_ != nullptr &&
-                self->op_ctx_->cancellation_token.isCancellationRequested()) {
-                return;
-            }
-            self->EnsureExecPathDetermined();
-            if (self->exec_path_ == ExprExecPath::RawData) {
-                if (self->ShouldPrefetchRawDataEagerly()) {
-                    self->PrefetchRawData();
-                    self->prefetched_ = true;
-                } else {
-                    self->raw_data_prefetch_deferred_ = true;
-                }
-            }
+            self->PrefetchOnCurrentThread();
         }));
+    }
+
+    // Execute the prefetch body without scheduling another task. This keeps
+    // composition wrappers that already run on the prefetch pool from adding
+    // a second queueing hop.
+    void
+    PrefetchOnCurrentThread() {
+        if (op_ctx_ != nullptr &&
+            op_ctx_->cancellation_token.isCancellationRequested()) {
+            return;
+        }
+        EnsureExecPathDetermined();
+        if (exec_path_ == ExprExecPath::RawData) {
+            if (ShouldPrefetchRawDataEagerly()) {
+                PrefetchRawData();
+                prefetched_ = true;
+            } else {
+                raw_data_prefetch_deferred_ = true;
+            }
+        }
     }
 
     bool

@@ -18,6 +18,7 @@ package datacoord
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -35,6 +36,7 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/datacoord/allocator"
 	"github.com/milvus-io/milvus/internal/datacoord/broker"
+	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/metastore/mocks"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/balance"
@@ -56,6 +58,12 @@ import (
 
 type ImportServicesSuite struct {
 	suite.Suite
+}
+
+func (s *ImportServicesSuite) SetupTest() {
+	previous := streaming.WAL()
+	streaming.SetupNoopWALForTest()
+	s.T().Cleanup(func() { streaming.SetWALForTest(previous) })
 }
 
 func TestImportServicesSuite(t *testing.T) {
@@ -94,6 +102,39 @@ func (s *ImportServicesSuite) TestImportV2_InvalidTimeoutReturnsError() {
 	s.NoError(err)
 	s.NotNil(resp)
 	s.True(errors.Is(merr.Error(resp.GetStatus()), merr.ErrImportFailed))
+}
+
+func (s *ImportServicesSuite) TestImportV2_InvalidBinlogPathsAreNotRetryable() {
+	paramtable.Init()
+	for _, paths := range [][]string{nil, {"insert", "delta", "extra"}} {
+		for _, test := range []struct {
+			name  string
+			files []*internalpb.ImportFile
+		}{
+			{"single", []*internalpb.ImportFile{{Paths: paths}}},
+			{"invalid_first", []*internalpb.ImportFile{{Paths: paths}, {Paths: []string{"valid"}}}},
+			{"invalid_last", []*internalpb.ImportFile{{Paths: []string{"valid"}}, {Paths: paths}}},
+		} {
+			s.Run(fmt.Sprintf("paths_%d/%s", len(paths), test.name), func() {
+				server := &Server{meta: &meta{}}
+				server.stateCode.Store(commonpb.StateCode_Healthy)
+				// A supplied job ID skips allocation; a nil chunk manager proves
+				// invalid path counts are rejected before accessing object storage.
+				resp, err := server.ImportV2(context.Background(), &internalpb.ImportRequestInternal{
+					JobID:   1,
+					Files:   test.files,
+					Options: []*commonpb.KeyValuePair{{Key: "backup", Value: "true"}},
+				})
+				s.Require().NoError(err)
+				s.Require().NotNil(resp)
+				status := resp.GetStatus()
+				s.Equal(merr.Code(merr.ErrImportFailed), status.GetCode())
+				s.False(status.GetRetriable())
+				s.ErrorIs(merr.Error(status), merr.ErrImportFailed)
+				s.Equal(merr.InputError, merr.GetErrorType(merr.Error(status)))
+			})
+		}
+	}
 }
 
 func (s *ImportServicesSuite) TestImportV2_L0ImportDisabledReturnsError() {
@@ -229,6 +270,7 @@ func (s *ImportServicesSuite) TestImportV2_BroadcastFailsReturnsError() {
 	server := &Server{
 		importMeta: &importMeta{},
 		broker:     mockBroker,
+		meta:       newTestMetaWithChunkManager(s.T()),
 	}
 	server.stateCode.Store(commonpb.StateCode_Healthy)
 
@@ -303,6 +345,7 @@ func (s *ImportServicesSuite) TestImportV2_SuccessReturnsJobID() {
 	server := &Server{
 		importMeta: &importMeta{},
 		broker:     mockBroker,
+		meta:       newTestMetaWithChunkManager(s.T()),
 	}
 	server.stateCode.Store(commonpb.StateCode_Healthy)
 
@@ -409,6 +452,7 @@ func (s *ImportServicesSuite) setupImportV2DuplicateBroadcast(importMeta ImportM
 	server := &Server{
 		importMeta: importMeta,
 		broker:     mockBroker,
+		meta:       newTestMetaWithChunkManager(s.T()),
 	}
 	server.stateCode.Store(commonpb.StateCode_Healthy)
 
@@ -598,6 +642,7 @@ func (s *ImportServicesSuite) TestImportV2_UsesDefaultDbNameWhenEmpty() {
 	server := &Server{
 		importMeta: &importMeta{},
 		broker:     mockBroker,
+		meta:       newTestMetaWithChunkManager(s.T()),
 	}
 	server.stateCode.Store(commonpb.StateCode_Healthy)
 
@@ -638,7 +683,7 @@ func (s *ImportServicesSuite) TestCreateImportJobFromAck_ServerNotHealthyReturns
 	server := &Server{}
 	server.stateCode.Store(commonpb.StateCode_Initializing)
 
-	resp, err := server.createImportJobFromAck(ctx, nil)
+	resp, err := server.createImportJobFromAck(ctx, nil, false)
 
 	s.NoError(err)
 	s.NotNil(resp)
@@ -656,7 +701,7 @@ func (s *ImportServicesSuite) TestCreateImportJobFromAck_InvalidTimeoutReturnsEr
 		},
 	}
 
-	resp, err := server.createImportJobFromAck(ctx, req)
+	resp, err := server.createImportJobFromAck(ctx, req, false)
 
 	s.NoError(err)
 	s.NotNil(resp)
@@ -682,7 +727,7 @@ func (s *ImportServicesSuite) TestCreateImportJobFromAck_AllocatorFailsReturnsEr
 		},
 	}
 
-	resp, err := server.createImportJobFromAck(ctx, req)
+	resp, err := server.createImportJobFromAck(ctx, req, false)
 
 	s.NoError(err)
 	s.NotNil(resp)
@@ -715,7 +760,7 @@ func (s *ImportServicesSuite) TestCreateImportJobFromAck_CollectionNotFoundRetur
 		},
 	}
 
-	resp, err := server.createImportJobFromAck(ctx, req)
+	resp, err := server.createImportJobFromAck(ctx, req, false)
 
 	s.NoError(err)
 	s.NotNil(resp)
@@ -747,7 +792,7 @@ func (s *ImportServicesSuite) TestCreateImportJobFromAck_CollectionNilReturnsErr
 		},
 	}
 
-	resp, err := server.createImportJobFromAck(ctx, req)
+	resp, err := server.createImportJobFromAck(ctx, req, false)
 
 	s.NoError(err)
 	s.NotNil(resp)
@@ -798,7 +843,7 @@ func (s *ImportServicesSuite) TestCreateImportJobFromAck_AddJobFailsReturnsError
 		JobID:         2000,
 	}
 
-	resp, err := server.createImportJobFromAck(ctx, req)
+	resp, err := server.createImportJobFromAck(ctx, req, false)
 
 	s.NoError(err)
 	s.NotNil(resp)
@@ -850,12 +895,13 @@ func (s *ImportServicesSuite) TestCreateImportJobFromAck_SuccessWithProvidedJobI
 		JobID:         2000, // Provided job ID should be used
 	}
 
-	resp, err := server.createImportJobFromAck(ctx, req)
+	resp, err := server.createImportJobFromAck(ctx, req, true)
 
 	s.NoError(err)
 	s.NotNil(resp)
 	s.Equal(int32(0), resp.GetStatus().GetCode())
 	s.Equal("2000", resp.GetJobID()) // Should use provided job ID
+	s.True(importMeta.GetJob(ctx, 2000).GetCommitByCoordinator())
 }
 
 func (s *ImportServicesSuite) TestCreateImportJobFromAck_SuccessAllocatesJobIDWhenNotProvided() {
@@ -902,7 +948,7 @@ func (s *ImportServicesSuite) TestCreateImportJobFromAck_SuccessAllocatesJobIDWh
 		JobID:         0, // Not provided - should use idStart (1000)
 	}
 
-	resp, err := server.createImportJobFromAck(ctx, req)
+	resp, err := server.createImportJobFromAck(ctx, req, false)
 
 	s.NoError(err)
 	s.NotNil(resp)
@@ -961,7 +1007,7 @@ func (s *ImportServicesSuite) TestCreateImportJobFromAck_AssignsFileIDs() {
 		JobID:         2000,
 	}
 
-	resp, err := server.createImportJobFromAck(ctx, req)
+	resp, err := server.createImportJobFromAck(ctx, req, false)
 
 	s.NoError(err)
 	s.NotNil(resp)
@@ -1030,7 +1076,7 @@ func (s *ImportServicesSuite) TestCreateImportJobFromAck_L0ImportDisabledCreates
 		JobID:         2000,
 	}
 
-	resp, err := server.createImportJobFromAck(ctx, req)
+	resp, err := server.createImportJobFromAck(ctx, req, false)
 
 	s.NoError(err)
 	s.NotNil(resp)
@@ -1098,7 +1144,7 @@ func (s *ImportServicesSuite) TestCreateImportJobFromAck_L0ImportEnabledCreatesP
 		JobID:         2000,
 	}
 
-	resp, err := server.createImportJobFromAck(ctx, req)
+	resp, err := server.createImportJobFromAck(ctx, req, false)
 
 	s.NoError(err)
 	s.NotNil(resp)

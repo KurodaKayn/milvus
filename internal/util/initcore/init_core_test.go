@@ -258,7 +258,7 @@ func TestRegisterQueryNodeLoadConfigCatchesUp(t *testing.T) {
 	assert.NoError(t, pt.Save(item.Key, "true"))
 
 	var applied atomic.Bool
-	registerQueryNodeLoadConfig(t.Context(), pt, func(enabled bool, budgetBytes, slots int64) {
+	registerQueryNodeLoadConfig(t.Context(), pt, func(enabled bool, budgetBytes, slots int64) error {
 		applied.Store(enabled)
 		if enabled {
 			assert.EqualValues(t, 2*1024*1024*1024, budgetBytes)
@@ -267,11 +267,26 @@ func TestRegisterQueryNodeLoadConfigCatchesUp(t *testing.T) {
 			assert.Zero(t, budgetBytes)
 			assert.Zero(t, slots)
 		}
+
+		return nil
 	})
 	assert.True(t, applied.Load())
 
 	assert.NoError(t, pt.Save(item.Key, "false"))
 	assert.False(t, applied.Load())
+}
+
+func TestLazyColumnGroupHotUpdate(t *testing.T) {
+	paramtable.Init()
+	pt := paramtable.Get()
+	SetupCoreConfigChangelCallback()
+	key := pt.QueryNodeCfg.TieredLazyColumnGroupEnabled.Key
+	previous := pt.QueryNodeCfg.TieredLazyColumnGroupEnabled.GetValue()
+	t.Cleanup(func() { assert.NoError(t, pt.Save(key, previous)) })
+	for _, value := range []string{"false", "true", "false"} {
+		assert.NoError(t, pt.Save(key, value))
+		assert.Equal(t, value == "true", getLazyColumnGroupEnabled())
+	}
 }
 
 // TestRegisterArrowIOThreadPoolWatchers verifies the lifted helper registers
